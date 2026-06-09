@@ -1,6 +1,6 @@
 # BlueZ Development Getting Started Guide
 
-Four documents covering four essential areas:
+Six documents covering BlueZ development essentials:
 
 | Document | What's Inside |
 |----------|---------------|
@@ -8,3 +8,5 @@ Four documents covering four essential areas:
 | [linux-kernel-bt-qca-full-flow.md](./linux-kernel-bt-qca-full-flow.md) | Kernel Bluetooth subsystem: QCA driver end-to-end — probe → power on → data path |
 | [Git_Upstream_Guide.md](./Git_Upstream_Guide.md) | Git & upstream workflow: essential commands, 5 real-world examples, checkpatch, Gerrit & mailing list submissions |
 | [yocto_qclinux_overview.md](./yocto_qclinux_overview.md) | Yocto/QCLinux build system: Recipe → Layer → KAS → BitBake, full pipeline explained |
+| [BREDR_CONNECTION_FLOW.md](./BREDR_CONNECTION_FLOW.md) | BlueZ BR/EDR connection flow: ACL, L2CAP, SDP, HCI command sequence, full call chain |
+| [dbus-framework.md](./dbus-framework.md) | BlueZ D-Bus framework: object hierarchy, interface registration, method dispatch, adapter/device API |
