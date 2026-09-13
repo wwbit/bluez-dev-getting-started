@@ -1,0 +1,337 @@
+From 3a606bf58745fbc7de1af4d4f7f3a8198699b563 Mon Sep 17 00:00:00 2001
+From: jinwli <islijw@163.com>
+Date: Sun, 13 Sep 2026 21:58:23 +0800
+Subject: [PATCH] Bluetooth: Add support for HCI Enhanced Accept Synchronous
+ Connection Request
+
+Add support for HCI_OP_ENHANCED_ACCEPT_SYNC_CONN_REQ (0x043e) to accept
+incoming SCO/eSCO connections with the full coding format parameters
+instead of only the legacy HCI_OP_ACCEPT_SYNC_CONN_REQ (0x0429) which can
+only express the air mode via the voice setting.
+
+The enhanced accept is used only when both the controller reports support
+for the command in its command support table and the driver has explicitly
+enabled it via the new HCI_QUIRK_ENHANCED_ACCEPT_SYNC_CONN quirk. Unlike
+the enhanced setup command the enhanced accept command has its own
+supported commands bit (commands[29] bit 0x10).
+
+Both the non-deferred accept path in hci_conn_request_evt and the deferred
+accept path in sco_conn_defer_accept now send the enhanced accept command
+when capable, filling in the coding format parameters based on the air
+mode from the voice setting (CVSD or transparent data).
+
+hci_qca enables the quirk for controllers with the new
+QCA_CAP_ENHANCED_ACCEPT_SYNC_CONN capability following the same pattern as
+the HFP hardware offload support.
+
+Signed-off-by: jinwli <islijw@163.com>
+---
+ drivers/bluetooth/hci_qca.c      | 17 +++++++++--
+ include/net/bluetooth/hci.h      | 39 +++++++++++++++++++++++++
+ include/net/bluetooth/hci_core.h | 10 +++++++
+ net/bluetooth/hci_conn.c         | 49 ++++++++++++++++++++++++++++++++
+ net/bluetooth/hci_event.c        | 34 +++++++++++++++-------
+ net/bluetooth/sco.c              | 23 +++++++++++++++
+ 6 files changed, 159 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_qca.c b/drivers/bluetooth/hci_qca.c
+index 7089e9b639b2..05547082de9d 100644
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@ -86,6 +86,7 @@ enum qca_capabilities {
+ 	QCA_CAP_WIDEBAND_SPEECH = BIT(0),
+ 	QCA_CAP_VALID_LE_STATES = BIT(1),
+ 	QCA_CAP_HFP_HW_OFFLOAD  = BIT(2),
++	QCA_CAP_ENHANCED_ACCEPT_SYNC_CONN = BIT(3),
+ };
+ 
+ /* HCI_IBS transmit side sleep protocol states */
+@@ -229,6 +230,7 @@ struct qca_serdev {
+ 	u32 oper_speed;
+ 	bool bdaddr_property_broken;
+ 	bool support_hfp_hw_offload;
++	bool support_enhanced_accept_sync_conn;
+ 	const char *firmware_name[2];
+ };
+ 
+@@ -2082,6 +2084,9 @@ static int qca_setup(struct hci_uart *hu)
+ 	if (qcadev && qcadev->support_hfp_hw_offload)
+ 		qca_configure_hfp_offload(hdev);
+ 
++	if (qcadev && qcadev->support_enhanced_accept_sync_conn)
++		hci_set_quirk(hdev, HCI_QUIRK_ENHANCED_ACCEPT_SYNC_CONN);
++
+ 	qca->fw_version = le16_to_cpu(ver.patch_ver);
+ 	qca->controller_id = le16_to_cpu(ver.rom_ver);
+ 	hci_devcd_register(hdev, hci_coredump_qca, qca_dmp_hdr, NULL);
+@@ -2108,7 +2113,8 @@ static const struct qca_device_data qca_soc_data_qca2066 __maybe_unused = {
+ 	.soc_type = QCA_QCA2066,
+ 	.num_vregs = 0,
+ 	.capabilities = QCA_CAP_WIDEBAND_SPEECH | QCA_CAP_VALID_LE_STATES |
+-			QCA_CAP_HFP_HW_OFFLOAD,
++			QCA_CAP_HFP_HW_OFFLOAD |
++			QCA_CAP_ENHANCED_ACCEPT_SYNC_CONN,
+ };
+ 
+ static const struct qca_device_data qca_soc_data_qca6390 __maybe_unused = {
+@@ -2201,7 +2207,8 @@ static const struct qca_device_data qca_soc_data_wcn6855 __maybe_unused = {
+ 	},
+ 	.num_vregs = 6,
+ 	.capabilities = QCA_CAP_WIDEBAND_SPEECH | QCA_CAP_VALID_LE_STATES |
+-			QCA_CAP_HFP_HW_OFFLOAD,
++			QCA_CAP_HFP_HW_OFFLOAD |
++			QCA_CAP_ENHANCED_ACCEPT_SYNC_CONN,
+ };
+ 
+ static const struct qca_device_data qca_soc_data_wcn7850 __maybe_unused = {
+@@ -2216,7 +2223,8 @@ static const struct qca_device_data qca_soc_data_wcn7850 __maybe_unused = {
+ 	},
+ 	.num_vregs = 6,
+ 	.capabilities = QCA_CAP_WIDEBAND_SPEECH | QCA_CAP_VALID_LE_STATES |
+-			QCA_CAP_HFP_HW_OFFLOAD,
++			QCA_CAP_HFP_HW_OFFLOAD |
++			QCA_CAP_ENHANCED_ACCEPT_SYNC_CONN,
+ };
+ 
+ static void qca_power_off(struct hci_uart *hu)
+@@ -2571,6 +2579,9 @@ static int qca_serdev_probe(struct serdev_device *serdev)
+ 
+ 		if (data->capabilities & QCA_CAP_HFP_HW_OFFLOAD)
+ 			qcadev->support_hfp_hw_offload = true;
++
++		if (data->capabilities & QCA_CAP_ENHANCED_ACCEPT_SYNC_CONN)
++			qcadev->support_enhanced_accept_sync_conn = true;
+ 	}
+ 
+ 	return 0;
+diff --git a/include/net/bluetooth/hci.h b/include/net/bluetooth/hci.h
+index 1641d879dbda..1ed36c7cbc0b 100644
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@ -271,6 +271,17 @@ enum {
+ 	 */
+ 	HCI_QUIRK_BROKEN_ENHANCED_SETUP_SYNC_CONN,
+ 
++	/*
++	 * When this quirk is set, enables the use of
++	 * HCI_OP_ENHANCED_ACCEPT_SYNC_CONN_REQ command to accept SCO
++	 * connections. The command is only used when the controller reports
++	 * support for it in the command support table.
++	 *
++	 * This quirk can be set before hci_register_dev is called or
++	 * during the hdev->setup vendor callback.
++	 */
++	HCI_QUIRK_ENHANCED_ACCEPT_SYNC_CONN,
++
+ 	/*
+ 	 * When this quirk is set, the HCI_OP_LE_SET_EXT_SCAN_ENABLE command is
+ 	 * disabled. This is required for some Broadcom controllers which
+@@ -996,6 +1007,34 @@ struct hci_coding_format {
+ 	__le16	vid;
+ } __packed;
+ 
++#define HCI_OP_ENHANCED_ACCEPT_SYNC_CONN_REQ	0x043e
++struct hci_cp_enhanced_accept_sync_conn_req {
++	bdaddr_t bdaddr;
++	__le32   tx_bandwidth;
++	__le32   rx_bandwidth;
++	struct	 hci_coding_format tx_coding_format;
++	struct	 hci_coding_format rx_coding_format;
++	__le16	 tx_codec_frame_size;
++	__le16	 rx_codec_frame_size;
++	__le32	 in_bandwidth;
++	__le32	 out_bandwidth;
++	struct	 hci_coding_format in_coding_format;
++	struct	 hci_coding_format out_coding_format;
++	__le16   in_coded_data_size;
++	__le16	 out_coded_data_size;
++	__u8	 in_pcm_data_format;
++	__u8	 out_pcm_data_format;
++	__u8	 in_pcm_sample_payload_msb_pos;
++	__u8	 out_pcm_sample_payload_msb_pos;
++	__u8	 in_data_path;
++	__u8	 out_data_path;
++	__u8	 in_transport_unit_size;
++	__u8	 out_transport_unit_size;
++	__le16   max_latency;
++	__le16   pkt_type;
++	__u8     retrans_effort;
++} __packed;
++
+ struct hci_cp_enhanced_setup_sync_conn {
+ 	__le16   handle;
+ 	__le32   tx_bandwidth;
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index c12cd6873f65..e3ac0a641055 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -1659,6 +1659,9 @@ struct hci_conn *hci_connect_acl(struct hci_dev *hdev, bdaddr_t *dst,
+ struct hci_conn *hci_connect_sco(struct hci_dev *hdev, int type, bdaddr_t *dst,
+ 				 __u16 setting, struct bt_codec *codec,
+ 				 u16 timeout);
++void hci_enhanced_accept_sync_conn_cp(struct hci_cp_enhanced_accept_sync_conn_req *cp,
++				      const bdaddr_t *bdaddr,
++				      __u16 voice_setting);
+ struct hci_conn *hci_bind_cis(struct hci_dev *hdev, bdaddr_t *dst,
+ 			      __u8 dst_type, struct bt_iso_qos *qos,
+ 			      u16 timeout);
+@@ -2077,6 +2080,13 @@ void hci_conn_del_sysfs(struct hci_conn *conn);
+ 	(((dev)->commands[29] & 0x08) && \
+ 	 !hci_test_quirk((dev), HCI_QUIRK_BROKEN_ENHANCED_SETUP_SYNC_CONN))
+ 
++/* Use enhanced accept if the controller supports the command and the driver
++ * has explicitly enabled it via the quirk.
++ */
++#define enhanced_accept_sync_conn_capable(dev) \
++	(((dev)->commands[29] & 0x10) && \
++	 hci_test_quirk((dev), HCI_QUIRK_ENHANCED_ACCEPT_SYNC_CONN))
++
+ /* Use ext scanning if set ext scan param and ext scan enable is supported */
+ #define use_ext_scan(dev) (((dev)->commands[37] & 0x20) && \
+ 			   ((dev)->commands[37] & 0x40) && \
+diff --git a/net/bluetooth/hci_conn.c b/net/bluetooth/hci_conn.c
+index c9466cb2c7c0..341cc56ee2ab 100644
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -399,6 +399,55 @@ static int hci_enhanced_setup_sync(struct hci_dev *hdev, void *data)
+ 	return 0;
+ }
+ 
++/* Fill in the coding format parameters of HCI_OP_ENHANCED_ACCEPT_SYNC_CONN_REQ
++ * based on the air mode from the voice setting. The incoming connection
++ * request does not carry any codec information, so only CVSD or transparent
++ * data can be expressed and the data path is always HCI.
++ */
++void hci_enhanced_accept_sync_conn_cp(struct hci_cp_enhanced_accept_sync_conn_req *cp,
++				      const bdaddr_t *bdaddr,
++				      __u16 voice_setting)
++{
++	bool transparent;
++
++	memset(cp, 0, sizeof(*cp));
++
++	bacpy(&cp->bdaddr, bdaddr);
++
++	transparent = (voice_setting & SCO_AIRMODE_MASK) == SCO_AIRMODE_TRANSP;
++
++	cp->tx_bandwidth = cpu_to_le32(0x00001f40);
++	cp->rx_bandwidth = cpu_to_le32(0x00001f40);
++	cp->tx_codec_frame_size = cpu_to_le16(60);
++	cp->rx_codec_frame_size = cpu_to_le16(60);
++	cp->in_coded_data_size = cpu_to_le16(16);
++	cp->out_coded_data_size = cpu_to_le16(16);
++	cp->in_pcm_data_format = 2;
++	cp->out_pcm_data_format = 2;
++
++	if (transparent) {
++		/* Transparent data, e.g. mSBC frames from the host. */
++		cp->tx_coding_format.id = 0x03;
++		cp->rx_coding_format.id = 0x03;
++		cp->in_coding_format.id = 0x03;
++		cp->out_coding_format.id = 0x03;
++		cp->in_bandwidth = cpu_to_le32(0x1f40);
++		cp->out_bandwidth = cpu_to_le32(0x1f40);
++		cp->in_transport_unit_size = 1;
++		cp->out_transport_unit_size = 1;
++	} else {
++		/* CVSD encoded PCM. */
++		cp->tx_coding_format.id = 2;
++		cp->rx_coding_format.id = 2;
++		cp->in_coding_format.id = 4;
++		cp->out_coding_format.id = 4;
++		cp->in_bandwidth = cpu_to_le32(16000);
++		cp->out_bandwidth = cpu_to_le32(16000);
++		cp->in_transport_unit_size = 16;
++		cp->out_transport_unit_size = 16;
++	}
++}
++
+ static bool hci_setup_sync_conn(struct hci_conn *conn, __u16 handle)
+ {
+ 	struct hci_dev *hdev = conn->hdev;
+diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
+index 03b805207ab0..52bb6e37598b 100644
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -3396,20 +3396,34 @@ static void hci_conn_request_evt(struct hci_dev *hdev, void *data,
+ 
+ 		hci_send_cmd(hdev, HCI_OP_ACCEPT_CONN_REQ, sizeof(cp), &cp);
+ 	} else if (!(flags & HCI_PROTO_DEFER)) {
+-		struct hci_cp_accept_sync_conn_req cp;
+ 		conn->state = BT_CONNECT;
+ 
+-		bacpy(&cp.bdaddr, &ev->bdaddr);
+-		cp.pkt_type = cpu_to_le16(conn->pkt_type);
++		if (enhanced_accept_sync_conn_capable(hdev)) {
++			struct hci_cp_enhanced_accept_sync_conn_req cp;
++
++			hci_enhanced_accept_sync_conn_cp(&cp, &ev->bdaddr,
++							 hdev->voice_setting);
++			cp.pkt_type = cpu_to_le16(conn->pkt_type);
++			cp.max_latency = cpu_to_le16(0xffff);
++			cp.retrans_effort = 0xff;
++
++			hci_send_cmd(hdev, HCI_OP_ENHANCED_ACCEPT_SYNC_CONN_REQ,
++				     sizeof(cp), &cp);
++		} else {
++			struct hci_cp_accept_sync_conn_req cp;
++
++			bacpy(&cp.bdaddr, &ev->bdaddr);
++			cp.pkt_type = cpu_to_le16(conn->pkt_type);
+ 
+-		cp.tx_bandwidth   = cpu_to_le32(0x00001f40);
+-		cp.rx_bandwidth   = cpu_to_le32(0x00001f40);
+-		cp.max_latency    = cpu_to_le16(0xffff);
+-		cp.content_format = cpu_to_le16(hdev->voice_setting);
+-		cp.retrans_effort = 0xff;
++			cp.tx_bandwidth   = cpu_to_le32(0x00001f40);
++			cp.rx_bandwidth   = cpu_to_le32(0x00001f40);
++			cp.max_latency    = cpu_to_le16(0xffff);
++			cp.content_format = cpu_to_le16(hdev->voice_setting);
++			cp.retrans_effort = 0xff;
+ 
+-		hci_send_cmd(hdev, HCI_OP_ACCEPT_SYNC_CONN_REQ, sizeof(cp),
+-			     &cp);
++			hci_send_cmd(hdev, HCI_OP_ACCEPT_SYNC_CONN_REQ,
++				     sizeof(cp), &cp);
++		}
+ 	} else {
+ 		conn->state = BT_CONNECT2;
+ 		hci_connect_cfm(conn, 0);
+diff --git a/net/bluetooth/sco.c b/net/bluetooth/sco.c
+index 3d4362a09df4..45f760895b0d 100644
+--- a/net/bluetooth/sco.c
++++ b/net/bluetooth/sco.c
+@@ -905,6 +905,29 @@ static void sco_conn_defer_accept(struct hci_conn *conn, u16 setting)
+ 		cp.role = 0x00; /* Ignored */
+ 
+ 		hci_send_cmd(hdev, HCI_OP_ACCEPT_CONN_REQ, sizeof(cp), &cp);
++	} else if (enhanced_accept_sync_conn_capable(hdev)) {
++		struct hci_cp_enhanced_accept_sync_conn_req cp;
++
++		hci_enhanced_accept_sync_conn_cp(&cp, &conn->dst, setting);
++		cp.pkt_type = cpu_to_le16(conn->pkt_type);
++
++		switch (setting & SCO_AIRMODE_MASK) {
++		case SCO_AIRMODE_TRANSP:
++			if (conn->pkt_type & ESCO_2EV3)
++				cp.max_latency = cpu_to_le16(0x0008);
++			else
++				cp.max_latency = cpu_to_le16(0x000D);
++			cp.retrans_effort = 0x02;
++			break;
++		default:
++			/* use CVSD settings as fallback */
++			cp.max_latency = cpu_to_le16(0xffff);
++			cp.retrans_effort = 0xff;
++			break;
++		}
++
++		hci_send_cmd(hdev, HCI_OP_ENHANCED_ACCEPT_SYNC_CONN_REQ,
++			     sizeof(cp), &cp);
+ 	} else {
+ 		struct hci_cp_accept_sync_conn_req cp;
+ 
+-- 
+2.43.0
+
